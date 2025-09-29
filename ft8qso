@@ -259,10 +259,10 @@ def main():
 		send_error("Could not start ft8cat")
 		sys.exit(1)
 	os.set_blocking(ft8cat.stdout.fileno(), False)
-	os.set_blocking(sys.stdout.fileno(), False)
+	#os.set_blocking(sys.stdout.fileno(), False) # don't do this; breaks slower machines
 	os.set_blocking(sys.stdin.fileno(), False)
 
-	# config (TODO: persist to JSON/XML)
+	# config
 	config = types.SimpleNamespace()
 	config.mycall = ''
 	config.mygrid = ''

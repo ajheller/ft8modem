@@ -21,7 +21,7 @@ namespace KK5JY {
 		//  NOTE: the patch number below is set by script; do not hand-edit.
 		//
 		std::string GetModemVersion() {
-			return (std::string("1.0.") + /*BEGIN*/ "10195" /*END*/ );
+			return (std::string("1.0.") + /*BEGIN*/ "10395" /*END*/ );
 		}
 	}
 }

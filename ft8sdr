@@ -218,8 +218,12 @@ def start_rtl_fm(fa, offset, mode, capture_stdin = False):
 #  stop_rtl_fm(handle) - stop the rtl_fm instance
 #
 def stop_rtl_fm(handle):
-	handle.send_signal(signal.SIGHUP) # HUP is enough to stop it
-	return handle.wait()
+	# send each signal in turn...
+	#   wait up to 1.0 seconds for process to exit each time
+	for sig in [ signal.SIGHUP, signal.SIGTERM, signal.SIGKILL ]:
+		handle.send_signal(sig)
+		try: return handle.wait(1.0)
+		except: pass
 
 
 #
@@ -497,14 +501,19 @@ def main():
 				if Verbose:
 					send_message("DEBUG: Change FA to %d\n" % fa)
 
+		# catch Control-C
 		except KeyboardInterrupt as ex:
-			if handle:
-				stop_rtl_fm(handle)
-			break # exit main loop
+			break # exit main loop, which will shut down
 
+		# catch everything else
 		except Exception as ex:
 			send_message("Unexpected exception: %s" % str(ex))
+			break # exit main loop, which will shut down
 	
+	# shut down the rtl_fm
+	if handle:
+		stop_rtl_fm(handle)
+
 	# shut down the server
 	server.stop()
 

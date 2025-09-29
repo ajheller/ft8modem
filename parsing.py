@@ -12,6 +12,9 @@ import time
 import sys
 import os
 
+# local modules
+import callsigns
+
 
 #
 #  mode2code(m)
@@ -74,46 +77,45 @@ def is73(s):
 	return s == 'RR73' or s == '73' or s == 'TU73'
 
 
+# lookup cache for grid squares
+gridcache = { }
+
+# non-grids that look like grids
+non_grids = [ 'RR73', 'rr73', 'TU73', 'tu73' ]
+
+
 #
 #  isgrid(s)
 #
 def isgrid(s):
 	if not s:
 		return False
-	s = s.upper()
-	if s == 'RR73' or s == 'TU73':
+	result = gridcache.get(s)
+	if result is not None:
+		return result
+	if s in non_grids:
+		gridcache[s] = False
 		return False
-	return len(s) == 4 and s[0].isalpha() and s[1].isalpha() and s[2].isdigit() and s[3].isdigit()
+	result = \
+		(len(s) == 4) and \
+		(ord('A') <= ord(s[0].upper()) <= ord('R')) and \
+		(ord('A') <= ord(s[1].upper()) <= ord('R')) and \
+		s[2].isdigit() and s[3].isdigit()
+	gridcache[s] = result
+	return result
 
 
 #
 #  iscall(s)
 #
 def iscall(s):
-	if not s:
+	if not s: # empty -> False
 		return False
-	if s.upper() == 'RR73':
+	if '.' in s: # '...' -> False
 		return False
-	if isgrid(s):
-		return False
-
-	digits = 0
-	letters = 0
-	slashes = 0
-	other = 0
-	if s.startswith('<') and s.endswith('>'):
+	if s[0] == '<' and s[-1] == '>': # unwrap hashed calls
 		s = s[1:-1]
-	for ch in s:
-		if ch.isdigit():
-			digits += 1
-		elif ch.isalpha():
-			letters += 1
-		elif ch == '/':
-			slashes += 1
-		else:
-			other += 1
-
-	return other == 0 and digits >= 1 and letters >= 2;
+	return callsigns.iscall(s) # chain to the real call detector
 
 
 #
@@ -149,7 +151,7 @@ def basecall(s):
 #  entry point - just unit tests
 #
 if __name__ == '__main__':
-	for i in [ 'kk5jy', 'n5osl', 'n7ul', 'rr73', 'rr7a', 'em16', 'FO33' ]:
+	for i in [ 'kk5jy', 'n5osl', 'n7ul', 'rr73', 'rr7a', 'em16', 'FO33', 'ab301', 'f301f', 'rr73', 'rr7a', 'em16', 'qr77' ]:
 		print("isgrid(%s) = %s" % (i, isgrid(i)))
 		print("iscall(%s) = %s" % (i, iscall(i)))
 	print("---------------------")

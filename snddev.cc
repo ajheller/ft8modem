@@ -96,6 +96,7 @@ ModemSoundDevice::ModemSoundDevice(const std::string &mode, size_t id, size_t ra
 	m_NetSize = 0;
 	m_Trail = 0.0;
 	m_Fudge = 0.0;
+	m_warndb = 0;
 
 	// allocate the decimation filter
 	setFilter(dec_taps);
@@ -547,6 +548,8 @@ void ModemSoundDevice::event(float *in, float *out, size_t count) {
 				if (db > 0) db = 0;
 				if (db < minimum_db) db = minimum_db;
 				KK5JY::FT8::send_message("INPUT", std::to_string(db));
+				if (m_warndb < 0 && db < m_warndb)
+					KK5JY::FT8::send_warning("Input level is low.");
 			}
 			m_MaxInput = 0;
 		}

@@ -17,6 +17,6 @@
 #  NOTE: the patch number below is set by script; do not hand-edit.
 #
 def GetModemVersion():
-	return "1.0." + "10195"
+	return "1.0." + "10395"
 
 # EOF

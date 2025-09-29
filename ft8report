@@ -202,7 +202,7 @@ def save_config():
 
 
 #
-#  build_datagram(cut)
+#  build_datagram(cut, now)
 #
 #  This is the main datagram construction function; the 'cut' is a
 #  list of spots, including call and supporting data, to be encoded

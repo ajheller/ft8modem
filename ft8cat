@@ -6,7 +6,7 @@
 #     * connects to rigctld(1) for radio control.
 #     * reads and updates radio RF VFOA, VFOB, Split.
 #     * restarts ft8modem when mode change is requested.
-#     * performs PTT funcions on behalf of the modem.
+#     * [optional] performs PTT funcions on behalf of the modem.
 #     * [optional] manages radio split mode, and VFOB.
 #     * [optional] updates an ALL.TXT file, emulating WSJT-X.
 #     * [optional] sends UDP updates to ft8collect and/or ft8report.
@@ -363,8 +363,8 @@ def main():
 	ft8modem = start_modem(cmdline)
 
 	# disable read() blocking on standard I/O
-	os.set_blocking(sys.stdout.fileno(), False)
 	os.set_blocking(sys.stdin.fileno(), False)
+	#os.set_blocking(sys.stdout.fileno(), False) # don't do this; breaks on slower machines
 
 	# how far is FB allowed to stray from FA before it is reset
 	max_drift = 5000 # Hz
@@ -494,7 +494,10 @@ def main():
 							if parts[0].isdigit():
 								when = int(parts[0])
 						if fa_last:
-							t_offset = 3 if mode == 'FT4' else 6
+							# dead band is three seconds for FT4, six seconds otherwise
+							t_offset = 4 if mode == 'FT4' else 10
+
+							# only send data to logger if a few seconds since last FA change
 							if when >= (fa_last - t_offset):
 								# logging (decode)
 								append_text(             AllTextPath, fa, raw, uts=AllTextUnix)  # log to file

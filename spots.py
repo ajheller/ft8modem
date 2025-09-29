@@ -29,10 +29,7 @@ import parsing
 #  Returns a dictionary or None
 #
 def parse_spot_core(line):
-	# trim off whitespace, make sure there is data left
-	if not line:
-		return None
-	line = line.strip()
+	# if no data, just give up
 	if not line:
 		return None
 
@@ -43,30 +40,33 @@ def parse_spot_core(line):
 
 	# start extracting
 	result = { }
-	if parts[2] != 'Rx' and parts[2] != 'Tx':
+	rx = (parts[2] == 'Rx')
+	tx = (parts[2] == 'Tx')
+	if not rx and not tx:
 		return None
 
 	# parse the time/date
-	if '_' in parts[0]:
+	when = parts[0]
+	if '_' in when:
 		# parse out the date and time substrings
-		result['date'], result['time'] = parts[0].split('_')
+		result['date'], result['time'] = when.split('_')
 
 		# now convert to Unix time
 		s = result['time'][4:6].strip()
 		if not s:
 			s = '00'
 		t = (
-			2000 + int(result['date'][0:2]),
-			int(result['date'][2:4]),
-			int(result['date'][4:6]),
-			int(result['time'][0:2]),
-			int(result['time'][2:4]),
-			int(s),
+			2000 + int(result['date'][0:2]), # Y
+			int(result['date'][2:4]),        # M
+			int(result['date'][4:6]),        # D
+			int(result['time'][0:2]),        # h
+			int(result['time'][2:4]),        # m
+			int(s),                          # s
 			-1, -1, 0)
 		result['when'] = int(time.mktime(t)) - time.timezone
 	else:
 		# parse out the Unix time
-		result['when'] = int(parts[0])
+		result['when'] = int(when)
 
 		# now convert to date and time strings
 		t = time.gmtime(result['when'])
@@ -75,8 +75,8 @@ def parse_spot_core(line):
 
 	# extract basic data
 	result['freq'] = parts[1]
-	result['tx'] = (parts[2] == 'Tx')
-	result['rx'] = (parts[2] == 'Rx')
+	result['tx'] = tx
+	result['rx'] = rx
 	result['mode'] = parts[3]
 	result['snr'] = parts[4]
 	result['dt'] = parts[5]
@@ -87,10 +87,8 @@ def parse_spot_core(line):
 	# parse the user message
 	rawwhat = parts[7:]
 	for i in rawwhat:
-		if i.startswith('<'):
-			i = i[1:]
-		if i.endswith('>'):
-			i = i[:-1]
+		if i[0] == '<' and i[-1] == '>':
+			i = i[1:-1] # trim brackets from hashed calls
 		result['what'].append(i)
 
 	# try to parse out calls
@@ -105,7 +103,7 @@ def parse_spot_core(line):
 		for i in result['what']:
 			if callsigns.iscall(i):
 				calls.append(i)
-			if parsing.isgrid(i):
+			elif parsing.isgrid(i):
 				result['grid'] = i
 		if len(calls) == 2:
 			result['to'] = calls[0]
@@ -155,17 +153,19 @@ def readall_open(path):
 #                            to the provided callback; if callback is
 #                            None, return the decodes as an array.
 #
-def readall(path, callback=None, ecallback=None):
-	result = None
+def readall(path, callback=None, ecallback=None, skip=0):
+	lines, consumed = 0, 0
 	with readall_open(path) as f:
-		while True:
-			# read one line
-			line = f.readline()
-			if not line:
-				return result
-			line = line.strip()
-			if not line:
+		for line in f:
+			# total counter
+			lines += 1
+
+			# skip support
+			if skip and lines <= skip:
 				continue
+
+			# consumed counter
+			consumed += 1
 
 			# parse the spot
 			d = parse_spot(line)
@@ -182,9 +182,8 @@ def readall(path, callback=None, ecallback=None):
 							ecallback("readall(%s) received %s from callback" % (path, str(ex)))
 						except:
 							pass
-			else:
-				if not result:
-					result = [ ]
-				result.append(d)
+
+	# return number of lines read, consumed
+	return lines, consumed
 
 # EOF: spots.py

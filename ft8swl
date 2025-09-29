@@ -59,14 +59,47 @@ def usage():
 	where.write("    -s         summarize state when finished\n")
 	where.write("    -n         show new call counts by day\n")
 	where.write("    -N         show new call counts by month\n")
+	where.write("    -B         show total call counts by band\n")
 	where.write("    -p         show counts per country (prefix sort)\n")
 	where.write("    -t         show total valid count (the vQSO count)\n")
 	where.write("    -z         -n and -N use UTC; otherwise local time\n")
 	where.write("    -b         -n and -N output limited to band (e.g., 20)\n")
+	where.write("    -r         resume; try to skip lines already processed\n")
 	where.write("    -v         show version information\n")
 	where.write("    -h         show this information\n")
 	where.write("\n")
 	sys.exit(1)
+
+
+#
+#  hash_file(fn) - return a string digest of part of a file
+#
+def hash_file(fn):
+	import hashlib
+
+	# how many bytes to hash
+	limit = 1024 * 1024
+
+	# the read block size
+	bsize = 4096
+
+	# build the hash
+	a = hashlib.blake2b()
+
+	count = 0
+	with io.open(fn, 'r') as f:
+		while count < limit:
+			howmany = limit - count
+			if howmany > bsize:
+				howmany = bsize
+			data = f.read(howmany)
+			if not data:
+				return 0
+			count += len(data)
+			a.update(data.encode('utf-8'))
+	if count != limit:
+		return 0
+	return a.hexdigest()
 
 
 #
@@ -110,7 +143,7 @@ def makekey(call, mode, freq):
 
 
 #
-#  callback_core(d)
+#  callback_core(d) - process one spot line
 #
 def callback_core(d):
 	global calls, total, added, skipped
@@ -140,12 +173,14 @@ def callback_core(d):
 		return # ... skip this record
 
 	# if key not found, make a new node
+	node = None
 	if k not in calls.keys():
-		calls[k] = { 'first' : when, 'last' : when, 'grids' : [ ], 'count' : 0, 'snr' : None }
+		node = calls[k] = { 'first' : when, 'last' : when, 'grids' : [ ], 'count' : 0, 'snr' : None }
 		added += 1
 
 	# fetch the node, whether new or existing, and update it
-	node = calls[k]
+	if not node:
+		node = calls[k]
 	isnew = False
 	if when > node['last']:
 		node['last'] = when
@@ -160,9 +195,9 @@ def callback_core(d):
 		node['count'] += 1
 	if snr:
 		nsnr = node['snr']
-		if not nsnr:
+		if nsnr is None:
 			node['snr'] = snr
-		elif nsnr and (snr > nsnr):
+		elif snr > nsnr:
 			node['snr'] = snr
 
 	# accumulate total number of records read
@@ -203,6 +238,9 @@ def main():
 	# show total vQSO count
 	total_count = False
 
+	# show vQSO count by band
+	band_counts = False
+
 	# modify 'call_counts' to monthly
 	monthly = False
 
@@ -224,15 +262,26 @@ def main():
 	# the output ADIF file
 	adif_path = None
 
+	# resume support
+	resume = False
+	file_hash = ''
+	last_line = 0
+	line_count = 0
+	consumed = 0
+
 	# read the command line
-	optlist, files = getopt.getopt(sys.argv[1:], 'a:b:c:df:hm:nNpstvz')
+	optlist, files = getopt.getopt(sys.argv[1:], 'a:Bb:c:df:hm:nNprstvz')
 	for opt in optlist:
-		if opt[0] == '-s':
+		if opt[0] == '-r':
+			resume = True
+		elif opt[0] == '-s':
 			summarize = True
 		elif opt[0] == '-p':
 			prefix_counts = True
 		elif opt[0] == '-t':
 			total_count = True
+		elif opt[0] == '-B':
+			band_counts = True
 		elif opt[0] == '-n':
 			call_counts = True
 			monthly = False
@@ -289,6 +338,9 @@ def main():
 					me = obj['mycall']
 				if 'updated' in obj.keys():
 					updated = obj['updated']
+				if resume and 'last_line' in obj.keys():
+					last_line = obj['last_line']
+					file_hash = obj['file_hash']
 
 				# detect MYCALL change
 				if mycall and me:
@@ -325,17 +377,50 @@ def main():
 			sys.stderr.write("DEBUG: Read %d records from JSON.\n" % len(calls))
 		sys.stderr.flush()
 	
-	# LOG: read the log files
+	#
+	#  LOG: read the log files
+	#
 	for fn in files:
+		# expand the path
+		fn = os.path.expanduser(fn)
+
+		# resume support; get the file hash of the first MB if possible
+		skip = 0
+		if resume:
+			# hash the first chunk of the file
+			local_hash = hash_file(fn)
+
+			# if there is an old hash to compare
+			if file_hash and last_line:
+				# DEBUG:
+				if verbose:
+					sys.stderr.write("DEBUG: resume support comparing old hash with new hash\n")
+					sys.stderr.write("DEBUG: old hash = '%s'\n" % file_hash)
+					sys.stderr.write("DEBUG: new hash = '%s'\n" % local_hash)
+
+				# if this is the same file as last time...
+				if local_hash == file_hash:
+					skip = last_line
+
+					# DEBUG:
+					if verbose:
+						sys.stderr.write("DEBUG: resume support starting on line %d\n" % (skip + 1))
+
+			# save the new hash value, in any case
+			if local_hash:
+				file_hash = local_hash
+
 		# DEBUG:
 		if verbose:
-			sys.stderr.write("DEBUG: Start reading %s\n" % fn)
+			sys.stderr.write("DEBUG: Start reading %s at line %d\n" % (fn, skip))
 
-		# expand the path and read the file
-		fn = os.path.expanduser(fn)
+		#
+		#  READ the file and process it
+		#
 		try:
-			spots.readall(fn, callback)
-			dirty = True
+			line_count, consumed = spots.readall(fn, callback, skip=skip)
+			if consumed:
+				dirty = True
 		except Exception as ex:
 			sys.stderr.write("Warning: Could not read file %s\n" % fn)
 
@@ -419,6 +504,20 @@ def main():
 		adif.flush()
 		adif.close()
 		adif = None
+
+	# show call counts by band
+	if band_counts:
+		# gather counts
+		counts = { }
+		for k in valid.keys():
+			band = k.split(':')[-1]
+			if band not in counts:
+				counts[band] = 0
+			counts[band] += 1
+
+		# report
+		for k in sorted(counts, key=lambda x: int(x)):
+			sys.stdout.write("%5sm %7d\n" % (k, counts[k]))
 
 	# show new call counts by day/month
 	if call_counts:
@@ -522,6 +621,9 @@ def main():
 			obj['mycall'] = mycall
 		obj['calls'] = calls
 		obj['updated'] = int(time.time())
+		if resume and line_count:
+			obj['file_hash'] = file_hash
+			obj['last_line'] = line_count
 		json.dump(obj, f)
 	
 	# done

@@ -2,7 +2,7 @@
 #
 #   Makefile
 #
-#   Copyright (C) 2023-2024 by Matt Roberts.
+#   Copyright (C) 2023-2025 by Matt Roberts.
 #   License: GNU GPL3 (www.gnu.org)
 #
 #
@@ -14,35 +14,39 @@ TARGETS3=test_abstime test_encode cpucores
 TARGETS4=test_decode decimate
 TARGETS5=test_cosine test_es
 TARGETS6=af2udp
+TARGETS7=ft8tail
 
 # these are the Python scripts to install
-SCRIPTS=ft8cat ft8collect ft8encode ft8modem ft8qso ft8report ft8sdr ft8swl
+SCRIPTS=ft8cat ft8collect ft8encode ft8modem ft8qso ft8report ft8sdr ft8swl ft8range onlycalls
 
 # these are the python support modules to install
 SCRIPT_MODULES=\
 	alltxt.py bands.py callsigns.py computefb.py \
 	conflicts.py fdutils.py fragment.py messages.py \
 	parsing.py pretty.py rigctld.py spots.py prefixes.py \
-	prefixes.txt tailall.py tailfile.py udpaf.py version.py
+	prefixes.txt tailall.py tailfile.py udpaf.py version.py \
+	gridsquares.py
 
 # installation targets
 BINDIR=/usr/local/bin
 LIBDIR=/usr/local/lib/ft8modem
 
 # dependencies
-TARGETS=$(TARGETS1) $(TARGETS2) $(TARGETS3) $(TARGETS4) $(TARGETS5) $(TARGETS6)
+TARGETS=$(TARGETS1) $(TARGETS2) $(TARGETS3) $(TARGETS4) $(TARGETS5) $(TARGETS6) $(TARGETS7)
 OBJECTS1=encode.o nlimits.o pipes.o snddev.o
 OBJECTS2=encode.o nlimits.o
 OBJECTS3=encode.o
 OBJECTS4=pipes.o
 OBJECTS5=nlimits.o
 OBJECTS6=
+OBJECTS7=
 LIBS1=-lm -lrtaudio -lsndfile -lpthread
 LIBS2=-lm -lsndfile
 LIBS3=-lm
 LIBS4=-lm -lsndfile -lpthread
 LIBS5=-lm -lsndfile
 LIBS6=-lm
+LIBS7=
 
 # build flags for C++ debugging
 CDEBUG=-Wall -ggdb -D_DEBUG
@@ -52,6 +56,8 @@ CDEBUG=-Wall -ggdb -D_DEBUG
 	g++ -Wall $(CFLAGS) $(CDEBUG) -c $<
 .cc.o:
 	g++ -Wall $(CFLAGS) $(CDEBUG) -c $<
+.c.o:
+	gcc -Wall $(CFLAGS) $(CDEBUG) -c $<
 
 # default target
 all: $(TARGETS)
@@ -75,6 +81,9 @@ $(TARGETS5): %: %.o $(OBJECTS5)
 $(TARGETS6): %: %.o $(OBJECTS6)
 	g++ $(CFLAGS) $(CDEBUG) -o $@ $@.o $(OBJECTS6) $(LIBS6)
 
+$(TARGETS7): %: %.o $(OBJECTS7)
+	gcc $(CFLAGS) $(CDEBUG) -o $@ $@.o $(OBJECTS7) $(LIBS7)
+
 # meta-targets
 clean:
 	rm -f $(TARGETS) core *.o *.wav
@@ -91,7 +100,7 @@ rebuild:
 
 install: strip
 	# install the compiled executables in $(BINDIR)
-	for i in $(TARGETS1) $(TARGETS2) $(TARGETS6) ; do install -o root -g root -m 0755 $$i $(BINDIR) ; done
+	for i in $(TARGETS1) $(TARGETS2) $(TARGETS6) $(TARGETS7) ; do install -o root -g root -m 0755 $$i $(BINDIR) ; done
 	# create the folder for the scripts and modules
 	install -o root -g root -m 0755 -d $(LIBDIR)
 	# install the scripts in $(LIBDIR)
@@ -107,7 +116,7 @@ uninstall:
 	for i in $(SCRIPTS) $(SCRIPT_MODULES) ; do rm -vf $(LIBDIR)/$$i ; done
 
 dep depend:
-	makedepend -Y *.cc *.cpp 2>/dev/null
+	makedepend -Y *.c *.cc *.cpp 2>/dev/null
 
 ignore:
 	svn propset svn:ignore -F .svnignore .

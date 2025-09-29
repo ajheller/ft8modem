@@ -348,12 +348,13 @@ int main(int argc, char**argv) {
 	int lead = -1;  // transmit lead-in time
 	int trail = -1; // receive window trail extension
 	int fudge = 0;  // frame clock offset
+	int warndb = 0; // dB level at which to warn user of low-level (must be <= 0)
 	bool keep = false; // flag to keep WAV after each decode
 	bool loop = false; // flag to decode transmitted audio, too
 	bool no_filter = false; // flag to disable decimation filter
 	{
 		int opt;
-		while ((opt = getopt(argc, argv, "e:i:j:t:T:f:hklm:r:v::yw:")) != -1) {
+		while ((opt = getopt(argc, argv, "e:i:j:t:T:f:hklm:r:v::yw:W:")) != -1) {
 			switch (opt) {
 				case 'e':
 					ext = optarg;
@@ -393,6 +394,9 @@ int main(int argc, char**argv) {
 					break;
 				case 'w':
 					trail = atoi(optarg);
+					break;
+				case 'W':
+					warndb = atoi(optarg);
 					break;
 				case 'h':
 				default:
@@ -571,6 +575,8 @@ int main(int argc, char**argv) {
 		audio.setTrail((double)(trail) / 1000);
 	if (fudge != 0)
 		audio.setFudge((double)(fudge) / 1000);
+	if (warndb)
+		audio.setWarndB(warndb);
 
 	// start the sound card recording
 	if ( ! audio.start()) {

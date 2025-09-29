@@ -85,6 +85,9 @@ freqs = {
 	},
 } # end freqs
 
+# build this from the above
+rfreqs = { }
+
 
 #
 #  bands() - return list of bands in the freqs table
@@ -117,7 +120,17 @@ def get_freq(mode, band):
 #  get_band(f) - convert frequency to wavelength band
 #
 def get_band(f):
-	global freqs
+	global freqs, rfreqs
+
+	# build the band reverse-lookup table on the first try
+	if not rfreqs:
+		for mode in freqs.keys():
+			rfreqs[mode] = { }
+			for band in freqs[mode].keys():
+				rfreqs[mode][int(freqs[mode][band] / 1000000)] = band
+
+		# DEBUG:
+		#print(rfreqs)
 
 	# parameter checks
 	if not f:
@@ -139,9 +152,16 @@ def get_band(f):
 		mhz = 28
 
 	# then search for a band matching MHz
+	try:
+		return rfreqs['ft8'][mhz]
+	except:
+		return None
+
+	# TODO: remove this; old code
 	for b in bands():
 		if int(get_freq('ft8', b) / 1000000) == mhz:
 			return b
+	return None
 		
 
 #

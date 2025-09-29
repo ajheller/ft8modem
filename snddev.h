@@ -125,6 +125,7 @@ class ModemSoundDevice : public SoundCard {
 		float *m_LoopBuffer; // used for monitoring TX sigs
 		float *m_NetBuffer; // used for UDP audio source
 		size_t m_NetSize; // size of m_NetBuffer
+		int m_warndb; // issue warning if input level is lower than this
 
 		enum TimeSlots m_Slot;
 
@@ -236,6 +237,12 @@ class ModemSoundDevice : public SoundCard {
 
 		// get the temp folder
 		bool getKeep() const { return m_Keep; }
+
+		// set the low audio warning level
+		int setWarndB(int db) { return (m_warndb = db); }
+
+		// get the low audio warning level
+		int getWarndB() { return m_warndb; }
 
 		// set the decimation filter tap count
 		void setFilter(int taps);

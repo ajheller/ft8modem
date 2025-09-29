@@ -129,6 +129,10 @@ def tailfile(fn, callback, ecallback=None, xcallback=None, tail_mode=TAIL_MODE_T
 	inode = None
 	fsize = None
 
+	# expand tilde
+	if fn[0] == '~':
+		fn = os.path.expanduser(fn)
+
 	#
 	#  outer loop - open file, optionally seek, then tail it
 	#
