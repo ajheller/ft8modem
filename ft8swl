@@ -1,0 +1,540 @@
+#!/usr/bin/env -S python3 -B
+#
+#   ft8swl - find unique calls in ALL.TXT logs.
+#
+#   This is a basic analysis tool, that reads ALL.TXT data, and builds
+#   up a table of unique stations, per call, per band, and per mode.
+#
+#   The main use of this script is to maintain an SWL log of stations
+#   heard over a long period of time.
+#
+#   Copyright (C) 2023-2025 by Matt Roberts.
+#   License: GNU GPL3 (www.gnu.org)
+#
+#
+
+
+# system modules
+import getopt
+import types
+import time
+import math
+import json
+import sys
+import os
+import os.path
+import io
+import datetime
+
+# local modules
+import spots
+import prefixes
+from version import *
+from parsing import *
+from bands import *
+
+# globals
+calls = { }
+total = 0
+added = 0
+skipped = 0
+
+
+#
+#  usage()
+#
+def usage():
+	# where to write usage text
+	where = sys.stdout
+
+	where.write("\n")
+	where.write("Usage: %s [options] <files> ...\n" % sys.argv[0])
+	where.write("\n")
+	where.write("Options include: \n")
+	where.write("    -f <file>  set the file to use for persistent storage\n")
+	where.write("    -a <file>  export virtual contacts to ADIF file\n")
+	where.write("    -c <ct>    when using -s, valid stations are those seen >= ct times\n")
+	where.write("    -m <call>  specify station call\n")
+	where.write("    -d         increase verbose output\n")
+	where.write("    -s         summarize state when finished\n")
+	where.write("    -n         show new call counts by day\n")
+	where.write("    -N         show new call counts by month\n")
+	where.write("    -p         show counts per country (prefix sort)\n")
+	where.write("    -t         show total valid count (the vQSO count)\n")
+	where.write("    -z         -n and -N use UTC; otherwise local time\n")
+	where.write("    -b         -n and -N output limited to band (e.g., 20)\n")
+	where.write("    -v         show version information\n")
+	where.write("    -h         show this information\n")
+	where.write("\n")
+	sys.exit(1)
+
+
+#
+#  def ago_string(seconds)
+#
+def ago_string(sec):
+	ago = int(abs(sec))
+	unit = 'seconds'
+	if ago >= 60:
+		ago /= 60
+		unit = 'minutes'
+		if ago >= 60:
+			ago /= 60
+			unit = 'hours'
+			if ago >= 24:
+				ago /= 24
+				unit = 'days'
+	return "%0.1f %s" % (ago, unit)
+
+
+#
+#  makekey(call, mode, freq)
+#
+def makekey(call, mode, freq):
+	if call is None or mode is None or freq is None:
+		return None
+
+	# convert the frequency as needed
+	if type(freq) is str:
+		freq = float(freq)
+	if freq >= 100000:
+		freq /= 1000000;
+		freq = math.trunc(freq)
+		freq = int(freq)
+	freq = get_band(freq)
+	if not freq:
+		return None
+
+	# build the key string
+	return '%s:%s:%d' % (call.upper(), mode.upper(), freq)
+
+
+#
+#  callback_core(d)
+#
+def callback_core(d):
+	global calls, total, added, skipped
+
+	# don't process bogus calls
+	if not iscall(d['from']):
+		return
+
+	# don't process TX frames
+	if d['tx']:
+		return
+
+	# extract the various fields
+	call = basecall(d['from'])
+	mode = d['mode']
+	freq = d['freq']
+	when = d['when']
+	grid = d['grid']
+	snr = d['snr']
+
+	# build a unique key for the 'calls' table
+	k = makekey(call, mode, freq)
+
+	# if we couldn't do that...
+	if not k:
+		skipped += 1
+		return # ... skip this record
+
+	# if key not found, make a new node
+	if k not in calls.keys():
+		calls[k] = { 'first' : when, 'last' : when, 'grids' : [ ], 'count' : 0, 'snr' : None }
+		added += 1
+
+	# fetch the node, whether new or existing, and update it
+	node = calls[k]
+	isnew = False
+	if when > node['last']:
+		node['last'] = when
+		isnew = True
+	if when < node['first']:
+		node['first'] = when
+		isnew = True
+	if grid and grid not in node['grids']:
+		node['grids'].append(grid)
+		isnew = True
+	if isnew:
+		node['count'] += 1
+	if snr:
+		nsnr = node['snr']
+		if not nsnr:
+			node['snr'] = snr
+		elif nsnr and (snr > nsnr):
+			node['snr'] = snr
+
+	# accumulate total number of records read
+	total += 1
+
+
+#
+#  callback(...) - wrapper around callback_core that catches exceptions
+#
+def callback(d):
+	try:
+		callback_core(d)
+	except Exception as ex:
+		sys.stderr.write("Error: callback_core raised: %s\n" % str(ex))
+
+
+#
+#  main()
+#
+def main():
+	global calls, total
+
+	# verbose flag
+	verbose = 0
+
+	# min count filter
+	mincount = 3
+
+	# show state of table to standard output when done
+	summarize = False
+
+	# show call counts by day
+	call_counts = False
+
+	# show prefix counts
+	prefix_counts = False
+
+	# show total vQSO count
+	total_count = False
+
+	# modify 'call_counts' to monthly
+	monthly = False
+
+	# JSON file to hold 'calls' after program ends
+	path = None
+
+	# my call, for exclusion purposes
+	mycall = None
+
+	# dirty flag, for determining whether to rewrite the state
+	dirty = False
+
+	# use UTC instead of local time
+	use_utc = False
+
+	# only consider records on specific band
+	limit_band = None
+
+	# the output ADIF file
+	adif_path = None
+
+	# read the command line
+	optlist, files = getopt.getopt(sys.argv[1:], 'a:b:c:df:hm:nNpstvz')
+	for opt in optlist:
+		if opt[0] == '-s':
+			summarize = True
+		elif opt[0] == '-p':
+			prefix_counts = True
+		elif opt[0] == '-t':
+			total_count = True
+		elif opt[0] == '-n':
+			call_counts = True
+			monthly = False
+		elif opt[0] == '-N':
+			call_counts = True
+			monthly = True
+		elif opt[0] == '-b':
+			arg = opt[1]
+			if not arg:
+				sys.stderr.write("Band (-b) option requires argument\n")
+				sys.exit(1)
+			if arg.endswith('m') or arg.endswith('M'):
+				arg = arg[:-1]
+			limit_band = int(arg)
+		elif opt[0] == '-z':
+			use_utc = True
+		elif opt[0] == '-h':
+			usage()
+		elif opt[0] == '-a':
+			adif_path = os.path.expanduser(opt[1])
+		elif opt[0] == '-f':
+			path = os.path.expanduser(opt[1])
+		elif opt[0] == '-m':
+			mycall = opt[1].strip().upper()
+			if not mycall:
+				mycall = None
+		elif opt[0] == '-c':
+			mincount = int(opt[1])
+			if mincount < 1:
+				sys.stderr.write("Count (-c) argument must be >= 1\n")
+				sys.exit(1)
+		elif opt[0] == '-d':
+			verbose += 1
+		elif opt[0] == '-v':
+			sys.stdout.write("ft8swl version %s\n" % GetModemVersion())
+			return 0
+
+	# if there is nothing to do, complain
+	if not path and not files:
+		usage()
+
+	# STATE: read state if provided
+	updated = 0
+	period = 0
+	if path and os.path.isfile(path):
+		# read the file
+		with io.open(path, 'r') as f:
+			try:
+				obj = json.load(f)
+				me = None
+				if 'calls' in obj.keys():
+					calls = obj['calls']
+				if 'mycall' in obj.keys():
+					me = obj['mycall']
+				if 'updated' in obj.keys():
+					updated = obj['updated']
+
+				# detect MYCALL change
+				if mycall and me:
+					if mycall != me:
+						dirty = True
+				elif mycall and not me:
+					dirty = True
+
+				# and then assign it
+				mycall = me
+			except Exception as ex:
+				sys.stderr.write("Error: %s\n" % str(ex))
+				sys.stderr.write("Error: Could not load JSON data from state file; halting.\n")
+				sys.exit(2)
+
+		# upgrade existing database with missing SNR
+		for k in calls.keys():
+			if not 'snr' in calls[k].keys():
+				calls[k]['snr'] = None
+				dirty = True
+
+	# DEBUG:
+	if verbose:
+		sys.stderr.write("DEBUG: %d input files given.\n" % len(files))
+		sys.stderr.write("DEBUG: Minimum hit count is %d.\n" % mincount)
+		if mycall:
+			sys.stderr.write("DEBUG: My call is %s\n" % mycall)
+		if path:
+			sys.stderr.write("DEBUG: JSON state file is %s\n" % path)
+		if updated:
+			period = ago = int(time.time() - updated);
+			sys.stderr.write("DEBUG: JSON state last updated on %s (%s ago).\n" % (time.asctime(time.localtime(updated)), ago_string(ago)))
+		if calls:
+			sys.stderr.write("DEBUG: Read %d records from JSON.\n" % len(calls))
+		sys.stderr.flush()
+	
+	# LOG: read the log files
+	for fn in files:
+		# DEBUG:
+		if verbose:
+			sys.stderr.write("DEBUG: Start reading %s\n" % fn)
+
+		# expand the path and read the file
+		fn = os.path.expanduser(fn)
+		try:
+			spots.readall(fn, callback)
+			dirty = True
+		except Exception as ex:
+			sys.stderr.write("Warning: Could not read file %s\n" % fn)
+
+	# DEBUG:
+	if verbose:
+		sys.stderr.write("DEBUG: Filtering records by hit count.\n")
+
+	# filter out spots with insufficient hit count
+	valid = { k:v for (k,v) in calls.items() if v['count'] >= mincount }
+
+	# filter out spots from me
+	if mycall:
+		if verbose:
+			sys.stderr.write("DEBUG: Filtering records from %s.\n" % mycall)
+
+		myfilter = mycall + ':'
+		valid = { k:v for (k,v) in valid.items() if k[0:len(myfilter)] != myfilter }
+	
+	# ADIF support
+	adif = None
+	if adif_path:
+		try:
+			# open the ADIf and write out a header
+			adif = io.open(adif_path, 'w')
+			adif.write("KK5JY ft8swl\n")
+			adif.write("<adif_ver:5>3.0.5\n")
+			adif.write("<EOH>\n")
+		except Exception as ex:
+			sys.stderr.write("Warning: Could not open ADIF file for writing: %s\n" % adif_path)
+			adif = None
+
+	# summarize (to screen or ADIF or both) database state
+	if summarize or adif_path:
+		shown = 0
+		for k in valid.keys():
+			node = valid[k]
+			call, mode, band = k.split(':')
+			first = node['first']
+			last  = node['last']
+			hits  = node['count']
+			snr   = node['snr']
+			freq  = get_freq(mode, int(band)) # convert mode+band into calling freq
+			freq  = str(freq)
+			grids = node['grids'] # just use the first grid square on this band/mode
+			grid = ''
+			if grids:
+				grid = grids[0]
+				grid = '<GRIDSQUARE:%d>%s' % (len(grid), grid)
+
+			# sanity check
+			if not freq:
+				sys.stderr.write("Warning: could not convert band %s and mode %s into frequency\n" % (band, mode))
+				continue
+
+			# date/time strings
+			dstr1 = time.strftime("%Y%m%d", time.gmtime(first))
+			tstr1 = time.strftime("%H%M%S", time.gmtime(first))
+			dstr2 = time.strftime("%Y%m%d", time.gmtime(first))
+			tstr2 = time.strftime("%H%M%S", time.gmtime(first))
+
+			# log to the ADIF file
+			if adif_path:
+				adif.write(
+					"<CALL:%d>%s<FREQ:%d>%s<MODE:%d>%s<BAND:%d>%sm"
+					"%s<QSO_DATE:8>%s<QSO_DATE_OFF:8>%s<TIME_ON:6>%s<TIME_OFF:6>%s<EOR>\n" % (
+					len(call), call, len(freq), freq, len(mode), mode, len(band), band,
+					grid, dstr1, dstr2, tstr1, tstr2))
+
+			# show the record summary
+			if summarize:
+				try:
+					sys.stdout.write("%-10s %-6s %3s %12d %12d %5d\n" % (call, mode, freq, first, last, hits))
+				except BrokenPipeError:
+					break # just give up
+				shown += 1
+		if summarize and verbose:
+			sys.stderr.write("DEBUG: There were %d records shown.\n" % shown)
+
+	# close the ADIF file
+	if adif:
+		adif.flush()
+		adif.close()
+		adif = None
+
+	# show new call counts by day/month
+	if call_counts:
+		counts = { }
+		zone = datetime.timezone.utc if use_utc else None
+		for k in calls.keys(): # TODO: should this be 'valid.keys()'?
+			# filter by band if requested
+			if limit_band and not k.endswith(':%d' % limit_band):
+				continue
+
+			# get the timestamp of the first spot
+			first = calls[k]['first']
+			first = datetime.datetime.fromtimestamp(first, zone)
+
+			key = None
+			if monthly:
+				key = "%04d-%02d" % (first.year, first.month)
+			else:
+				key = "%04d-%02d-%02d" % (first.year, first.month, first.day)
+			if key in counts.keys():
+				counts[key] += 1
+			else:
+				counts[key] = 1
+		for k in sorted(counts.keys()):
+			sys.stdout.write("%s %d\n" % (k, counts[k]))
+	
+	# show prefix counts
+	if prefix_counts:
+		table = { }
+		for k in valid.keys():
+			# filter by band if requested
+			if limit_band and not k.endswith(':%d' % limit_band):
+				continue
+			
+			# get the prefix for the call
+			data = prefixes.get_prefix(k)
+			if not data:
+				country = 'Unknown'
+			else:
+				prefix, country = data
+
+			# accumulate counts
+			if country in table.keys():
+				table[country] += 1
+			else:
+				table[country] = 1
+
+		# convert the table to a list
+		table = [ (k, table[k]) for k in table ]
+
+		# output sorted prefixes
+		for k, v in sorted(table, reverse=True, key=lambda x: x[1]):
+			sys.stdout.write("%6d %s\n" % (v, k))
+
+	# show total count
+	if total_count:
+		sys.stdout.write("Total: %d\n" % len(valid))
+
+	# DEBUG: show basic statistics
+	if verbose:
+		if total:
+			sys.stderr.write("DEBUG: Read %d log spots.\n" % total)
+		if added:
+			sys.stderr.write("DEBUG: Added %d new records" % added)
+			if period:
+				days = period / (24 * 3600)
+				rate = added / days
+				sys.stderr.write(", %0.1f per day" % rate)
+			sys.stderr.write(".\n")
+		sys.stderr.write("DEBUG: Found %d total records.\n" % len(calls))
+		sys.stderr.write("DEBUG: Found %d valid records.\n" % len(valid))
+		if skipped:
+			sys.stderr.write("DEBUG: Skipped %d malformed records.\n" % skipped)
+		snrs = { k:v for (k,v) in calls.items() if calls[k]['snr'] is not None }
+		sys.stderr.write("DEBUG: Found %d records with SNR.\n" % len(snrs))
+		grids = { k:v for (k,v) in calls.items() if calls[k]['grids'] }
+		sys.stderr.write("DEBUG: Found %d records with grid squares.\n" % len(grids))
+		grids = { k:v for (k,v) in calls.items() if calls[k]['grids'] and len(calls[k]['grids']) > 1 }
+		sys.stderr.write("DEBUG: Found %d records with multiple grid squares.\n" % len(grids))
+	
+	# serialize the data
+	if not path:
+		sys.exit(0)
+	
+	# only update the JSON file if something changed
+	if not dirty:
+		sys.exit(0)
+
+	# DEBUG:
+	if verbose:
+		sys.stderr.write("DEBUG: Update JSON state file.\n")
+
+	# back up the original, if it exists
+	if os.path.isfile(path):
+		os.rename(path, path + '.bak')
+	
+	# write the new file
+	with io.open(path, 'w') as f:
+		obj = { }
+		if mycall:
+			obj['mycall'] = mycall
+		obj['calls'] = calls
+		obj['updated'] = int(time.time())
+		json.dump(obj, f)
+	
+	# done
+	sys.exit(0)
+
+
+#
+#  entry point
+#
+if __name__ == '__main__':
+	try:
+		main()
+	except KeyboardInterrupt:
+		pass
+
+# EOF

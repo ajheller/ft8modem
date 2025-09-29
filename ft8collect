@@ -1,0 +1,265 @@
+#!/usr/bin/env -S python3 -B
+#
+#   ft8collect - aggregate ALL.TXT-style messages from multiple
+#                'ft8cat' instances via UDP.
+#
+#   Copyright (C) 2024 by Matt Roberts.
+#   License: GNU GPL3 (www.gnu.org)
+#
+#
+
+#
+#  TODO:
+#     1. Add support for collecting from files, too.
+#     2. Add deduplication logic, in case multiple clients report
+#        the same spot at roughly the same time:
+#        a. Cache incoming data across (call, time, mode, band)
+#        b. Take the first unique spot across the fields in (a)
+#        c. Reject subsequent matches.
+#        d. Clean the cache of old (maybe >= 20m) values.
+#           i. This can be done in the same block as append_text(...)
+#
+
+# system modules
+import socket
+import getopt
+import select
+import random
+import signal
+import syslog
+import time
+import sys
+import os
+import io
+
+# local modules
+from alltxt import *
+from fdutils import *
+from version import *
+
+
+#
+#  globals
+#
+
+# flag to run in background
+background = False
+
+
+#
+#  usage() - show the command line options
+#
+def usage():
+	sys.stdout.write("\n")
+	sys.stdout.write("Usage: %s [options]\n" % sys.argv[0])
+	sys.stdout.write("\n")
+	sys.stdout.write("Collect ALL.TXT data from multiple ft8cat instances, and write to\n")
+	sys.stdout.write("a single file.\n")
+	sys.stdout.write("\n")
+	sys.stdout.write("Options include:\n")
+	sys.stdout.write("\t-a <path> - specify the path to write ALL.TXT\n")
+	sys.stdout.write("\t-p <port> - specify the UDP port to bind, or an address:port pair\n")
+	sys.stdout.write("\t-d        - increase debugging output\n")
+	sys.stdout.write("\t-h        - show this information\n")
+	sys.stdout.write("\t-v        - show the version number\n")
+	sys.stdout.write("\t-z        - run in background\n")
+	sys.stdout.write("\n")
+	sys.stdout.write("The -a and -p options are required.\n")
+	sys.stdout.write("\n")
+	sys.exit(1)
+
+
+#
+#  signal_handler(sig, stk_frm)
+#
+def signal_handler(sig, stk_frm):
+	pass # just nop
+
+
+#
+#  append single line to log file
+#
+def append_data(path, data):
+	global background
+
+	# convert line from bytes to string, and trim it
+	line = None
+	try:
+		line = data.decode('ascii')
+	except:
+		return
+	if line:
+		line = line.strip()
+	if not line:
+		return
+
+	# sanity checks; first, make sure there are enough chars to do check
+	if len(line) < 6:
+		return
+
+	# next make sure there is a timestamp-looking preamble
+	check = line[0:6]
+	if not check.isdigit():
+		return
+
+	# append the line to the file, with a single newline, and flush it
+	try:
+		# this also makes sure the file handle is closed after the flush()
+		with io.open(path, 'a') as f:
+			f.write(line + '\n')
+			f.flush()
+	except Exception as ex:
+		msg = "Could not append to %s: %s" % (path, str(ex))
+		if background:
+			syslog.syslog(msg)
+		else:
+			sys.stderr.write(msg + '\n')
+
+
+#
+#  safe_close(fd) - close a file descriptor cleanly
+#
+def safe_close(fd):
+	if fd < 0:
+		return
+	try:
+		fd.close()
+	except:
+		pass
+
+
+#
+#  main()
+#
+def main():
+	global background
+
+	# path to ALL.TXT
+	path = None
+
+	# UDP listen port
+	port = None
+
+	# bind address
+	addr = None
+
+	# verbosity level when in foreground
+	verbose = 0
+
+	# read the command line
+	optlist, cmdline = getopt.getopt(sys.argv[1:], 'a:i:p:dhvz')
+	for opt in optlist:
+		if opt[0] == '-a':
+			path = opt[1]
+		elif opt[0] == '-p':
+			if ':' in opt[1]:
+				addr, port = opt[1].split(':', 1)
+			else:
+				port = opt[1]
+			if not port.isdigit():
+				sys.stderr.write("Port number must be numeric")
+				sys.exit(1)
+			port = int(port)
+		elif opt[0] == '-d':
+			verbose += 1
+		elif opt[0] == '-h':
+			usage()
+		elif opt[0] == '-v':
+			sys.stdout.write("ft8collect version %s\n" % GetModemVersion())
+			return 0
+		elif opt[0] == '-z':
+			background = True
+
+	# make sure there is enough information
+	if not path:
+		usage()
+	
+	# if invalid port, bail
+	if port is None:
+		usage()
+	if not port or port < 0 or port > 65535:
+		sys.stderr.write("Port must be between 1 and 65535\n")
+		sys.exit(1)
+	
+	# determine the bind IP
+	if addr:
+		if addr not in [ '127.0.0.1', '::1', '0.0.0.0', '::' ]:
+			addr = socket.gethostbyname(addr)
+		if not addr:
+			sys.stderr.write(
+				"Error: Could not determine bind IP address.\n")
+			sys.exit(1)
+	else:
+		addr = '127.0.0.1'
+
+	# DEBUG:
+	if verbose:
+		sys.stderr.write(
+			"DEBUG: Start: path = %s; addr = %s; port = %d\n" % (path, addr, port));
+	
+	# allocate the UDP listener
+	udp = None
+	try:
+		udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+		udp.bind((addr, port))
+	except Exception as ex:
+		sys.stderr.write("Could not open listener: %s\n" % str(ex))
+		sys.exit(1)
+
+	# if the file does not exist, create it before forking into background
+	if path:
+		path = os.path.expanduser(path)
+		if not os.path.isfile(path):
+			try:
+				with io.open(path, 'w'):
+					pass # just touch the file
+			except Exception as ex:
+				sys.stderr.write("Could not create file %s: %s\n" % (path, str(ex)))
+				sys.exit(1)
+
+	# fork into background
+	if background:
+		# cancel verbose messages when running in background
+		verbose = False
+
+		# fork into background
+		child_pid = os.fork()
+		if child_pid > 0: # parent
+			sys.exit(0)   # exit
+		os.setsid() # set session leader
+		os.umask(0) # set umask to zero
+
+		# handle signals when running in background
+		signal.signal(signal.SIGHUP, signal_handler)
+		signal.signal(signal.SIGINT, signal_handler)
+
+		# set up syslog
+		syslog.openlog('ft8collect');
+		syslog.syslog('Starting in background as pid=%d, path=%s' % (os.getpid(), path))
+	
+	# run the main loop
+	while True:
+		try:
+			rs = [ ]
+			if udp:
+				rs.append(udp)
+			rs, ws, es = select.select(rs, [], [], 0.200)
+			if rs and udp in rs:
+				data, who = udp.recvfrom(256)
+				if data and who:
+					append_data(path, data)
+
+		except KeyboardInterrupt as ex:
+			sys.exit(0)
+
+	# clean up
+	safe_close(udp)
+
+
+#
+#  entry point
+#
+if __name__ == '__main__':
+	main()
+
+# EOF

@@ -1,0 +1,536 @@
+#!/usr/bin/env -S python3 -B
+#
+#   ft8sdr - CAT wrapper around rtl_fm
+#
+#   This utility is a supervisor for 'rtl_fm', for receiver devices
+#   supported by that software.  The 'ft8sdr' will run a single
+#   instance of rtl_fm, adjusting its frequency and mode as needed.
+#
+#   A TCP server, similar to that provided by rigctld(1), is started,
+#   and the frequency and mode commands send to that socket are used
+#   to adjust the receiver.
+#
+#   This is intended to allow inexpensive RTL-SDR hardware to be
+#   used to feed the 'ft8modem' for a lightweight monitor station
+#   for supported modes.
+#
+#   The 'ft8sdr' can feed audio to a modem instance in two different
+#   ways: via ALSA loopback, or directly via UDP.  For the latter,
+#   see the -u option of 'ft8sdr', and the 'udp:port' device ID
+#   of the 'ft8modem'.
+#
+#   For multi-receiver sites, also see the 'ft8collect' utility.
+#
+#   For PSKreporter support, also see the 'ft8report' utility.
+#
+#   Copyright (C) 2024 by Matt Roberts.
+#   License: GNU GPL3 (www.gnu.org)
+#
+#
+
+
+# system modules
+import subprocess
+import getopt
+import socket
+import select
+import signal
+import syslog
+import time
+import sys
+import os
+import io
+
+# local modules
+from version import *
+from rigctld import RigControlServer, get_real_mode
+from pretty import *
+from udpaf import *
+
+
+#
+#  globals - default values
+#
+
+# the TCP port for the rigctld emulation; change with -p option
+CatPort = 4532
+
+# the device ID
+Serial = None
+
+# the rtl_fm options, sans the -f; these are reasonable defaults for feeding ft8modem/jt9
+Options = ''
+
+# the UDP port for sending raw audio data (default = disabled)
+UdpPort = 0
+
+# verbosity flag
+Verbose = 0
+
+# use the RTL-SDR Q-branch direct sampling below 25MHz
+QBranch = False
+
+# the sampling rate
+Rate = 24000
+
+# run in background if true
+Background = False
+
+# the profile name if provided
+Profile = None
+
+# flag indicating the loop should continue
+KeepGoing = True
+
+# minimum time between frequency changes
+MinQSY = 5 # seconds
+
+# QSY debouncing state
+LastQSY = 0
+
+#
+#  usage()
+#
+def usage():
+	global CatPort
+
+	out = sys.stdout
+	out.write("\n")
+	out.write("Usage: %s [<options>]\n" % sys.argv[0])
+	out.write("\n")
+	out.write("    This application provides a simple CAT interface, similar to rigctld(1).\n")
+	out.write("    It uses that interface to start and manage an instance of 'rtl_fm'.  The\n")
+	out.write("    CAT interfaces allows for changing the frequency and mode.\n")
+	out.write("\n")
+	out.write("    Options can include:\n")
+	out.write("    -c <off>    Set converter offset in Hz, use 'M' suffix for MHz (default: 0)\n")
+	out.write("    -d <dev>    Specify the serial number of the receiver\n")
+	out.write("    -e <name>   Set profile name, to allow multiple simultaneous instances\n")
+	out.write("    -p <port>   Set TCP port for local rigctld emulation (default: %d)\n" % CatPort)
+	out.write("    -o <opts>   Add rtl_fm arguments as a single string (use quotes)\n")
+	out.write("    -u <port>   Capture rtl_fm output and send it to a UDP port\n")
+	out.write("    -r <rate>   Set the output sampling rate\n")
+	out.write("    -a <port>   Shortcut to set -d, -e, -p, and -u all to same numeric value,\n")
+	out.write("                mostly for use with multiple receivers running on the same PC\n")
+	out.write("    -q          Add Q-branch direct2 option for RTL-SDR when frequency < 25 MHz\n")
+	out.write("    -z          Run in background, log to syslog\n")
+	out.write("    -V          Increase verbose output\n")
+	out.write("    -v          Show version number\n")
+	out.write("\n")
+	sys.exit(1)
+
+
+#
+#  send_message(s) - talk to stderr or syslog, depending on other options
+#
+def send_message(s):
+	global Background
+
+	# trim up the string, do nothing if it is empty or None
+	if not s:
+		return
+	s = s.strip()
+	if not s:
+		return
+
+	# send the message somewhere
+	if Background:
+		syslog.syslog(s)
+	else:
+		sys.stderr.write(s + '\n')
+
+
+#
+#  qsy_ok() - return true iff ok to change frequency
+#             used to 'debounce' frequency changes to avoid hanging the hardware
+#
+def qsy_ok():
+	global LastQSY, MinQSY
+
+	# if receiver never started, start is ok
+	now = time.time()
+	if not LastQSY:
+		LastQSY = now
+		return True
+
+	# otherwise, start only OK if 'MinQSY' seconds elapsed since last start
+	result = (now - LastQSY) >= MinQSY
+	if result:
+		LastQSY = now
+	return result
+
+
+#
+#  start_rtl_fm(fa, offset, mode) - returns Popen object
+#
+def start_rtl_fm(fa, offset, mode, capture_stdin = False):
+	global Options, Verbose, QBranch, Background, Serial, Rate
+
+	# compute the effective frequency
+	target = int(fa + offset)
+
+	# get the SDR mode for the mode provided
+	if mode:
+		mode = get_real_mode(mode)
+
+	# make sure the target freq is sane
+	if target <= 0:
+		send_message("Error: Request for frequency %s + %s = %s, skipping.\n" % (ff(fa), ff(offset), ff(target)))
+		return None
+
+	# DEBUG:
+	if Verbose: # talk
+		sys.stderr.write("#\n")
+		sys.stderr.write("#  ft8sdr - set f = %s, mode = %s" % (ff(fa), mode))
+		if offset != 0:
+			sys.stderr.write(" (offset = %s; f_eff = %s)" % (ff(offset), ff(target)))
+		if Serial:
+			sys.stderr.write("; device = %s" % Serial)
+		sys.stderr.write("\n#\n")
+		sys.stderr.flush()
+
+	# build command line
+	args = [ 'rtl_fm', '-f', str(target) ] # start with dial frequency
+	if mode:                          # if mode provided...
+		args += [ '-M', mode ]        # ...append it
+	else:                             # otherwise...
+		args += [ '-M', 'usb' ]       # ...assume USB
+	if QBranch and target < 25000000: # if QBranch enabled, and frequency too low...
+		args += [ '-E', 'direct2' ]   # ...add direct sampling on Q-branch
+	if Rate:                          # if sampling rate provided...
+		args += [ '-s', str(Rate) ]   # ...append it
+	if Serial:
+		args += [ '-d', Serial ]      # add the device serial number
+	args += Options.split()           # add standard options, plus user-provided options
+	args += [ '-' ]                   # write to standard output
+
+	# decide what to do with stdout
+	stdout = subprocess.PIPE if capture_stdin else None
+
+	# decide what to do with stderr
+	stderr = subprocess.PIPE if Background else None
+
+	# call Popen to get started
+	return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+
+
+#
+#  stop_rtl_fm(handle) - stop the rtl_fm instance
+#
+def stop_rtl_fm(handle):
+	handle.send_signal(signal.SIGHUP) # HUP is enough to stop it
+	return handle.wait()
+
+
+#
+#  signal_handler(sig, stk_frm)
+#
+def signal_handler(sig, stk_frm):
+	global KeepGoing
+	KeepGoing = False # cleanly exit
+
+
+#
+#  main()
+#
+def main():
+	global CatPort, Options, Verbose, QBranch, UdpPort, Background, Profile, Serial, KeepGoing, Rate
+
+	# local state
+	last_fa = 0
+	last_fb = 0
+	last_mode = None
+	fa = 0
+	fb = 0
+	mode = None
+	offset = 0
+
+	# read the command line
+	try:
+		optlist, cmdline = getopt.getopt(sys.argv[1:], 'a:c:d:e:ho:p:qr:u:vVz')
+		for opt in optlist:
+			if opt[0] == '-c': # converter offset
+				value = opt[1]
+				mhz = False
+				if value[-1].lower() == 'm':
+					value = value[:-1]
+					mhz = True
+				hz = float(value)
+				if mhz:
+					hz *= 1000000.0
+				offset = int(hz)
+			elif opt[0] == '-d': # device ID
+				Serial = opt[1]
+			elif opt[0] == '-e': # profile name
+				Profile = opt[1]
+			elif opt[0] == '-p':  # TCP port
+				CatPort = int(opt[1])
+				if CatPort < 1 or CatPort > 65535:
+					raise Exception("CAT port must be in the range of (1, 65535)")
+			elif opt[0] == '-u':  # TCP port
+				UdpPort = int(opt[1])
+				if CatPort < 1 or CatPort > 65535:
+					raise Exception("UDP audio port must be in the range of (1, 65535)")
+			elif opt[0] == '-o':  # extra rtl_fm options
+				if Options:
+					Options += ' '
+				Options += opt[1]
+			elif opt[0] == '-a':  # set -d, -e, -p, and -u to the same value
+				allValue = int(opt[1])
+				if allValue <= 0:
+					raise Exception("The -a value must be an integer, in the range of (1, 65535)")
+				Serial = str(allValue)    # device serial #
+				Profile = str(allValue)   # profile name
+				CatPort = allValue        # CAT socket bind port
+				UdpPort = allValue        # UDP target port for audio
+			elif opt[0] == '-V':  # verbosity ++
+				Verbose += 1
+			elif opt[0] == '-q':  # use direct-sampling Q-branch
+				QBranch = True
+			elif opt[0] == '-r':  # sampling rate
+				Rate = int(opt[1])
+			elif opt[0] == '-h':  # help
+				usage()
+			elif opt[0] == '-v':  # version
+				sys.stdout.write("ft8sdr version %s\n" % GetModemVersion())
+				return 0
+			elif opt[0] == '-z':  # background
+				Background = True
+	except Exception as ex:
+		sys.stderr.write("Error reading options: %s\n" % str(ex))
+		return 1
+	except getopt.GetoptError as ex:
+		sys.stderr.write("Error reading options: %s\n" % str(ex))
+		return 1
+	
+	# sanity checks
+	if '-f' in Options:
+		sys.stderr.write("Error: Please do not specify '-f' option in the value for '-o'.\n")
+		sys.exit(1)
+	
+	# DEBUG:
+	if Verbose and offset != 0:
+		updown = "up" if offset > 0 else "down"
+		sys.stderr.write("DEBUG: Converter offset is %d Hz (%s)\n" % (offset, updown))
+	
+	# load settings
+	lines = [ ]
+	fn = os.path.join(os.path.expanduser('~'), '.ft8sdrrc')
+	if Profile:
+		fn += '.'
+		fn += Profile
+	if os.path.isfile(fn):
+		with io.open(fn, 'r') as f:
+			lines = f.readlines()
+
+		# DEBUG:
+		if Verbose > 1:
+			sys.stderr.write("DEBUG: Read saved state: %s\n" % fn)
+
+	# parse settings
+	for line in lines:
+		parts = line.split()
+		if len(parts) == 2:
+			if parts[0] == 'FA':
+				fa = last_fa = int(parts[1])
+			elif parts[0] == 'FB':
+				fb = last_fb = int(parts[1])
+			elif parts[0] == 'MODE':
+				mode = last_mode = parts[1]
+	
+	# use a reasonable default if no config
+	if not fa:
+		fa = last_fa = 28000000
+	if not fb:
+		fb = last_fb = 28000000
+	if not mode:
+		mode = last_mode = 'USB'
+
+	# start the TCP server
+	server = None
+	while not server:
+		try:
+			server = RigControlServer(CatPort)
+			server.set_vfo_a(fa)
+			server.set_vfo_b(fb)
+			server.set_mode(last_mode)
+			server.start() # go
+		except Exception as ex:
+			delay = 5.0
+			sys.stderr.write("Error starting CAT server: %s; will try again in %d seconds\n" % (str(ex), delay))
+			time.sleep(delay)
+
+	# if UDP selected, set up the sender
+	udp = None
+	if UdpPort:
+		# DEBUG
+		if Verbose:
+			sys.stderr.write("DEBUG: Using UDP port %d\n" % UdpPort)
+
+		# allocate the sender
+		udp = AudioUDP(UdpPort)
+	
+	# run in background if requested
+	if Background:
+		# cancel verbose messages when running in background
+		Verbose = 0
+
+		# fork into background
+		child_pid = os.fork()
+		if child_pid > 0: # parent
+			sys.exit(0)   # exit
+		os.setsid() # set session leader
+		os.umask(0) # set umask to zero
+
+		# set up syslog
+		syslog.openlog('ft8sdr');
+		msg = 'Starting in background as pid=%d, catport=%d' % (os.getpid(), CatPort)
+		if UdpPort:
+			msg += ", udpport=%d" % UdpPort
+		syslog.syslog(msg)
+
+	# handle signals post-fork
+	signal.signal(signal.SIGTERM, signal_handler)
+	signal.signal(signal.SIGHUP, signal_handler)
+	signal.signal(signal.SIGINT, signal_handler)
+
+	#
+	#  main program loop
+	#
+	handle = None
+	while KeepGoing:
+		try:
+			#
+			#  do a select(...) call to look for audio data and perform slow spinning
+			#
+
+			# set up the select(...) call
+			rd = [ ]
+			out_fd = None
+			err_fd = None
+			if UdpPort and handle and handle.stdout:
+				out_fd = handle.stdout
+				rd.append(out_fd)
+			if Background and handle and handle.stderr:
+				err_fd = handle.stderr
+				rd.append(err_fd)
+
+			# do the select(...) call
+			rd, wr, ex = select.select(rd, [], [], 0.125)
+
+			# handle any ready descriptors
+			if rd and out_fd and out_fd in rd:
+				data = handle.stdout.read(256) # raw bytes
+				if data:
+					udp.send(data)
+				else:
+					handle.stdout.close()
+					handle.stdout = None
+
+			if rd and err_fd and err_fd in rd:
+				data = handle.stderr.readline()
+				if data:
+					send_message(data.decode('ascii'))
+				else:
+					handle.stderr.close()
+					handle.stderr = None
+
+			# read mode and VFO frequencies
+			fa = server.get_vfo_a()
+			fb = server.get_vfo_b()
+			mode = server.get_mode()
+
+			# periodically check the child process to make sure it's still running
+			result = None
+			if handle:
+				result = handle.poll()
+			if result or not handle:
+				# talk about the error
+				if handle:
+					send_message("rtl_fm pid %d unexpectedly returned code %d; restarting.\n" % (handle.pid, result))
+				else:
+					send_message("rtl_fm is not running, restarting.\n")
+
+				# child has stopped, start a new one at the current VFO-A
+				handle = None
+				if qsy_ok():
+					handle = start_rtl_fm(fa, offset, mode, UdpPort > 0)
+
+			# FA changed?
+			if (fa != last_fa) and qsy_ok():
+				# store the new frequency
+				last_fa = fa
+
+				# stop the old rtl_fm if it is running
+				if handle:
+					stop_rtl_fm(handle)
+
+				# then start a new one
+				handle = start_rtl_fm(fa, offset, mode, UdpPort > 0)
+
+				# DEBUG:
+				if Verbose:
+					send_message("DEBUG: Change FA to %d\n" % fa)
+
+			# FB changed?
+			if fb != last_fb:
+				# store the new frequency
+				last_fb = fb
+
+				# DEBUG:
+				if Verbose:
+					send_message("DEBUG: Change FB to %d\n" % fb)
+
+			# Mode changed?
+			if (mode != last_mode) and qsy_ok():
+				# store the new mode
+				last_mode = mode
+
+				# stop the old rtl_fm if it is running
+				if handle:
+					stop_rtl_fm(handle)
+
+				# then start a new one
+				handle = start_rtl_fm(fa, offset, mode, UdpPort > 0)
+
+				# DEBUG:
+				if Verbose:
+					send_message("DEBUG: Change FA to %d\n" % fa)
+
+		except KeyboardInterrupt as ex:
+			if handle:
+				stop_rtl_fm(handle)
+			break # exit main loop
+
+		except Exception as ex:
+			send_message("Unexpected exception: %s" % str(ex))
+	
+	# shut down the server
+	server.stop()
+
+	# save configuration
+	fn = os.path.join(os.path.expanduser('~'), '.ft8sdrrc')
+	if Profile:
+		fn += '.'
+		fn += Profile
+	with io.open(fn, 'w') as f:
+		f.write("FA %d\n" % fa)
+		f.write("FB %d\n" % fb)
+		if mode:
+			f.write("MODE %s\n" % mode)
+
+		# DEBUG:
+		if Verbose > 1:
+			sys.stderr.write("DEBUG: Wrote saved state: %s\n" % fn)
+
+	# all done
+	sys.exit(0)
+
+
+#
+#  entry point
+#
+if __name__ == '__main__':
+	main()
+
+# EOF

@@ -1,0 +1,493 @@
+#!/usr/bin/env -S python3 -B
+#
+#   ft8qso - QSO manager for the ft8modem
+#
+#   This is the QSO-level logic, which implements basic message
+#   sequencing.  It also provides very basic watchdog functions
+#   so that the QSO does not drag on endlessly.  The logic also
+#   ensures that the QSO sequence progresses or stops, even if
+#   the other station does not implement a logical message sequence.
+#
+#   Higher-level functions such as blocklist, QSO bust detection,
+#   clobber detection, auto-logging, etc., should be provided by
+#   callers.
+#
+#   This application adds or "stacks" the following commands onto
+#   the 'ft8modem' and 'ft8cat' commands:
+#       + MYGRID <grid>
+#       + MYCALL <call>
+#       + CQ <freq>
+#       + QSO <call> [<freq>]
+#       + STOP
+#
+#   Copyright (C) 2023-2024 by Matt Roberts.
+#   License: GNU GPL3 (www.gnu.org)
+#
+#
+
+#
+#  TODO:
+#    1. Implement repeats; how many times to send a message without
+#       a reply from the other station.
+#
+
+# system modules
+import subprocess
+import getopt
+import select
+import types
+import time
+import sys
+import os
+import io
+
+# local modules
+from fdutils import *
+from messages import *
+from parsing import *
+from version import *
+
+
+#
+#  usage()
+#
+def usage():
+	sys.stdout.write("Usage: %s <ft8cat command line>\n" % sys.argv[0])
+	sys.exit(1)
+
+
+#
+#  validaf(af)
+#
+def validaf(af):
+	if not af:
+		return False
+	if af[-1] in 'EeOo':
+		return af[:-1].isdigit()
+	return af.isdigit()
+
+
+#
+#  formatsnr(snr)
+#
+def formatsnr(snr):
+	return "%+03d" % int(snr)
+
+
+#
+#  reset(call) - reset counters for call
+#
+def reset(call):
+	key = basecall(call)
+	if not key or not key in state.cache.keys():
+		return
+	node = state.cache[key]
+	if not node:
+		return
+	node.txcount = 0
+	node.msgnum = 1
+
+
+#
+#  getwhat(...) - auto-sequence message selection
+#
+def getwhat(state, config, initial = False):
+	call = state.working
+	if not call:
+		send_debug("QSO call not set; nothing to auto-sequence")
+		return None
+
+	# fetch the node
+	key = basecall(call)
+	if not key in state.cache.keys():
+		send_debug("Station not found in cache; nothing to auto-sequence\n")
+		return None
+
+	# fetch the other station's cache
+	node = state.cache[key]
+
+	# if this is a CQ, return grid or none
+	if node.cq:
+		if initial:
+			node.txcount = 0
+			node.msgnum = 1
+			return config.mygrid
+		return None
+
+	# for everything else addressed to me...
+	elif node.to == config.mycall:
+		what = None
+		msgnum = 1 if initial else 6
+		if isgrid(node.what):          # GRID ->
+			what = formatsnr(node.snr) #      -> +SNR
+			msgnum = 2
+		elif isreport(node.what) and isroger(node.what): # R+SNR ->
+			what = 'RR73'                                #       -> RR73
+			msgnum = 4
+		elif isreport(node.what):            # +SNR ->
+			what = 'R' + formatsnr(node.snr) #      -> R+SNR
+			msgnum = 3
+		elif isroger(node.what):       # RRR ->
+			what = '73'                #     -> 73
+			msgnum = 5
+
+		# implement max-message limit
+		if what:
+			# don't allow rolling back to prior messages
+			if msgnum < node.msgnum:
+				send_debug("Message rollback detected; transmission suppressed")
+				return None
+
+			# if too many messages sent, quit
+			node.txcount += 1
+			if node.txcount > config.maxmsgs:
+				send_debug("Station %s message count exceeded; transmission suppressed" % key)
+				return None
+
+		# return the message to send
+		send_debug("Returning '%s' for next message for station %s" % (what if what else 'None', key))
+		return what
+
+	# invalid auto-sequence, send nothing
+	send_debug("Auto-sequence failed; transmission suppressed")
+	return None
+
+
+#
+#  overlay - update cache entry
+#
+def overlay(cache, decode):
+	key = basecall(decode.fr)
+	if not key:
+		send_debug("Call %s returned basecall = %s" % (decode.fr, key))
+		return
+	if not key in cache.keys():
+		send_debug("Added %s to cache" % key)
+		cache[key] = decode
+		return
+	node = cache[key]
+	if decode.grid:
+		node.grid = decode.grid
+	node.when = decode.when
+	node.what = decode.what
+	node.mode = decode.mode
+	node.snr = decode.snr
+	node.af = decode.af
+	node.df = decode.df
+	node.raw = decode.raw
+	node.cq = decode.cq
+	node.to = decode.to
+	send_debug("Updated %s in cache" % key)
+	
+
+#
+#  parse_decode(...)
+#
+def parse_decode(line):
+	result = types.SimpleNamespace()
+	line = line.upper().strip()
+	parts = line.split(maxsplit=5)
+	result.when = parts[0]
+	result.snr = parts[1]
+	result.df = parts[2]
+	result.af = parts[3]
+	result.mode = 'FT4' if parts[4] == '+' else 'FT8'
+	result.raw = parts[5]
+	result.cq = False
+	result.fr = None
+	result.to = None
+	result.grid = None
+	result.what = None
+
+	# trim off decoder confidence stuff
+	for i in [ 'a1', 'a2', 'a3', 'a4', ' ?' ]:
+		if line.endswith(i):
+			line = line[:-len(i)].strip()
+
+	# pick apart the message to get calls and frame content
+	calls = [ ]
+	for i in result.raw.split():
+		if i == 'CQ' or i == 'CQDX' or i == 'CQFD':
+			result.cq = True
+		elif iscall(i):
+			calls.append(i)
+		elif isgrid(i):
+			result.grid = i
+			result.what = i
+		elif isreport(i) or isroger(i) or is73(i):
+			result.what = i
+	if len(calls) == 1:
+		if result.cq:
+			result.fr = calls[0]
+		else:
+			result.to = calls[0]
+	elif len(calls) == 2:
+		result.to = calls[0]
+		result.fr = calls[1]
+
+	# DEBUG:
+	send_trace("parse_decode(...) -> raw = '%s', mode = '%s', fr = '%s', to = '%s', cq = '%s'\n" % (result.raw, result.mode, result.fr, result.to, result.cq))
+			
+	# done
+	return result
+
+
+#
+#  main()
+#
+def main():
+	# verbose flag
+	verbose = False
+
+	# read the command line
+	optlist, cmdline = getopt.getopt(sys.argv[1:], 'dv')
+	for opt in optlist:
+		if opt[0] == '-d':
+			verbose = True
+		elif opt[0] == '-v':
+			sys.stdout.write("ft8qso version %s\n" % GetModemVersion())
+			return 0
+
+	# and validate it
+	if not cmdline:
+		usage()
+
+	# start the ft8modem chain
+	send_trace("Start ft8cat, args = %s" % str(cmdline))
+	ft8cat = subprocess.Popen(cmdline, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+	if not ft8cat:
+		send_error("Could not start ft8cat")
+		sys.exit(1)
+	os.set_blocking(ft8cat.stdout.fileno(), False)
+	os.set_blocking(sys.stdout.fileno(), False)
+	os.set_blocking(sys.stdin.fileno(), False)
+
+	# config (TODO: persist to JSON/XML)
+	config = types.SimpleNamespace()
+	config.mycall = ''
+	config.mygrid = ''
+	config.maxmsgs = 8  # max messages to send to same station per WORK command
+	
+	# state
+	state = types.SimpleNamespace()
+	state.working = ''  # current working call
+	state.af      = "0" # working AF and optional slot
+	state.cache = { }
+	block_size = 128 # bytes per read() or recv() call
+
+	# load settings
+	lines = [ ]
+	fn = os.path.join(os.path.expanduser('~'), '.ft8qsorc')
+	if os.path.exists(fn):
+		with io.open(fn, 'r') as f:
+			lines = f.readlines()
+
+	# parse settings
+	for line in lines:
+		parts = line.split()
+		if len(parts) == 2:
+			if parts[0] == 'MYCALL':
+				config.mycall = parts[1]
+			elif parts[0] == 'MYGRID':
+				config.mygrid = parts[1]
+
+	egbuf = b''  # pipeline egress buffer (bytes object for raw I/O)
+	igbuf = ''   # pipeline ingress buffer
+	while True:
+		try:
+			r = [ ft8cat.stdout, sys.stdin ]
+			w = [ ]
+			e = [ ]
+			r, w, e = select.select(r, w, e, 0.5)
+
+			# modem -> user
+			if ft8cat.stdout in r:
+				# read all the waiting data
+				newdata = read_all_bytes(ft8cat.stdout, block_size)
+				if not newdata:
+					break
+				egbuf += newdata
+
+				# loop through the available lines
+				while b'\n' in egbuf:
+					line, egbuf = egbuf.split(b'\n', 1)
+					line = line.decode('utf8-')
+
+					# process decodes
+					if line.startswith("D: "):
+						d = parse_decode(line[3:])
+						if d.fr:
+							overlay(state.cache, d)
+						else:
+							send_debug("Decode produced no FROM call: %s\n" % line)
+
+						# DEBUG:
+						key = basecall(d.fr)
+						if key in state.cache.keys():
+							send_trace(str(state.cache[key]))
+
+						# DEBUG:
+						send_trace('Compare "%s" <-> "%s"' % (d.fr, state.working))
+
+						# look for ongoing QSO
+						if d.fr == state.working:
+							what = getwhat(state, config)
+							if what:
+								# send response message
+								msg = "%s %s %s" % (state.working, config.mycall, what)
+								ft8cat.stdin.write(("%s %s\n" % (state.af, msg)).encode('ascii'))
+								ft8cat.stdin.flush()
+								send_trace('Send response: %s' % msg)
+							else:
+								# cancel the QSO
+								state.working = None
+								send_trace('Cancel QSO with %s' % d.fr)
+
+						#
+						#  TODO:
+						#    + implement retries and timeouts
+						#
+
+					# repeat line towards user
+					send_message(line)
+
+			# user -> modem
+			if sys.stdin in r:
+				# read all the waiting data
+				newdata = read_all_str(sys.stdin, block_size)
+				if not newdata:
+					break
+				igbuf += newdata
+
+				# loop through the available lines
+				while '\n' in igbuf:
+					line, igbuf = igbuf.split('\n', 1)
+					line = line.upper()
+
+					# MYCALL:
+					if line.startswith('MYCALL '):
+						line = line.split(maxsplit=1)
+						if line and line[0] and len(line) == 2 and iscall(line[1]):
+							config.mycall = line[1]
+							send_info("MYCALL now %s" % config.mycall)
+						else:
+							send_error("Invalid call provided")
+							continue
+
+					# MYGRID:
+					elif line.startswith('MYGRID '):
+						line = line.split(maxsplit=1)
+						if line and line[0] and len(line) == 2 and isgrid(line[1]):
+							config.mygrid = line[1]
+							send_info("MYGRID now %s" % config.mygrid)
+						else:
+							send_error("Invalid grid provided")
+							continue
+
+					# CQ: call CQ at a specific frequency
+					elif line.startswith('CQ '):
+						parts = line.split(maxsplit=2)
+						if len(parts) != 2:
+							send_error("Missing CQ frequency")
+							continue
+
+						af = parts[1]
+						if not validaf(af):
+							send_error("Invalid CQ frequency")
+							continue
+
+						# send the CQ
+						msg = '%s CQ %s %s\n' % (af, config.mycall, config.mygrid)
+						ft8cat.stdin.write(msg.encode('ascii'))
+						ft8cat.stdin.flush()
+						send_trace("Send CQ: %s" % msg)
+						continue
+
+					# QSO: work a station
+					elif line.startswith('QSO '):
+						parts = line.split(maxsplit=3)
+						if not parts or not parts[0] or len(parts) < 2:
+							send_error("Invalid QSO command")
+							continue
+
+						# validate call
+						call = parts[1]
+						if not iscall(call):
+							send_error("Invalid QSO call")
+							continue
+
+						# read the cache for this call
+						key = basecall(call)
+						node = None
+						if key and key in state.cache.keys():
+							node = state.cache[key]
+							reset(key)
+						if not node:
+							#
+							#  TODO: to enable blind-calling, perhaps
+							#        make an empty cache node here?
+							#
+							send_error("Station %s not in cache; cannot QSO" % call)
+							continue
+
+						# if AF not specified, try to fetch it from cache
+						if len(parts) < 3:
+							parts.append(node.af) # append the missing AF
+							send_debug("Using station AF of %s" % node.af)
+
+						# validate audio frequency
+						if not parts[2:] or not validaf(parts[2]):
+							send_error("Invalid QSO frequency")
+							continue
+
+						# call or reply
+						state.working = call
+						state.af = parts[2]
+						what = getwhat(state, config, True)
+						if not what:
+							# cancel the QSO
+							state.working = None
+
+							# complain
+							send_error("Could not auto-sequence '%s'" % call)
+							continue
+
+						send_info("Start QSO with %s\n" % state.working)
+
+						# start the QSO with the first message
+						msg = "%s %s %s" % (state.working, config.mycall, what)
+						ft8cat.stdin.write(("%s %s\n" % (state.af, msg)).encode('ascii'))
+						ft8cat.stdin.flush()
+
+					# STOP: stop working anything
+					elif line.startswith('STOP'):
+						state.working = ''
+						ft8cat.stdin.write('STOP\n'.encode('ascii'))
+						ft8cat.stdin.flush()
+
+					# pass unused commands to child process
+					else:
+						ft8cat.stdin.write((line + '\n').encode('ascii'))
+						ft8cat.stdin.flush()
+
+		except KeyboardInterrupt as ex:
+			ft8cat.stdin.close()
+			sys.exit(0)
+
+	# save configuration
+	fn = os.path.join(os.path.expanduser('~'), '.ft8qsorc')
+	with io.open(fn, 'w') as f:
+		f.write("MYCALL %s\n" % config.mycall)
+		f.write("MYGRID %s\n" % config.mygrid)
+
+	# done
+	sys.exit(0)
+
+
+#
+#  entry point
+#
+if __name__ == '__main__':
+	main()
+
+# EOF
